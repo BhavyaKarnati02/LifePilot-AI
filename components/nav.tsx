@@ -1,0 +1,3 @@
+'use client'
+import Link from 'next/link';import {usePathname,useRouter} from 'next/navigation';import {createClient} from '@/lib/supabase/client'
+export function Nav(){const pathname=usePathname();const router=useRouter();if(pathname.startsWith('/auth/'))return null;const logout=async()=>{await createClient().auth.signOut();router.replace('/auth/login');router.refresh()};return <nav className="nav"><Link className="brand" href="/goals">LifePilot<span> AI</span></Link><div className="navlinks"><Link href="/goals">Goals</Link><Link href="/progress">Progress</Link><Link href="/memory">Memory</Link><Link href="/agent">Agent</Link><button onClick={logout}>Logout</button></div></nav>}
