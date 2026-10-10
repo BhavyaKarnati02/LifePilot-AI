@@ -1,3 +1,77 @@
-import{BedrockRuntimeClient,ConverseCommand}from'@aws-sdk/client-bedrock-runtime';import{NextResponse}from'next/server'
-const client=new BedrockRuntimeClient({region:process.env.AWS_REGION||'us-east-1'}),modelId=process.env.BEDROCK_MODEL_ID||'amazon.nova-lite-v1:0';const clean=(s:string)=>s.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```$/i,'').trim()
-export async function POST(req:Request){try{const b=await req.json();if(!b.goal?.title||!String(b.reason||'').trim())return NextResponse.json({error:'Goal and reason are required.'},{status:400});const prompt=`You are LifePilot. Replan this existing goal because circumstances changed. Preserve completed work and adapt remaining work. GOAL: ${JSON.stringify(b.goal)} CURRENT TASKS: ${JSON.stringify(b.tasks||[])} CHANGE: ${b.reason} Return ONLY JSON: {"summary":"what changed","tasks":[{"title":"...","duration":"30 min","day":1,"purpose":"...","steps":["..."],"result":"...","adjusted":true}]}. Rules: 4-12 tasks, day 1-30, practical, do not restart unnecessarily.`;const r=await client.send(new ConverseCommand({modelId,messages:[{role:'user',content:[{text:prompt}]}],inferenceConfig:{maxTokens:5000,temperature:0.3}}));const out=JSON.parse(clean(r.output?.message?.content?.map((x:any)=>x.text||'').join('')||'{}'));if(!out.summary||!Array.isArray(out.tasks))throw Error('Invalid replan');return NextResponse.json(out)}catch(e){console.error(e);return NextResponse.json({error:'LifePilot could not replan. Check AWS Bedrock configuration.'},{status:500})}}
+import { NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+import { replanGoal } from '@/lib/ai-planner'
+
+export async function POST(request: Request) {
+  try {
+    const supabase = await createClient()
+    const {
+      data: { user },
+    } = await supabase.auth.getUser()
+
+    if (!user) {
+      return NextResponse.json(
+        { error: 'Unauthorized' },
+        { status: 401 },
+      )
+    }
+
+    const body = await request.json()
+
+    if (!body.goal?.id || !String(body.reason || '').trim()) {
+      return NextResponse.json(
+        { error: 'Goal and change reason are required.' },
+        { status: 400 },
+      )
+    }
+
+    const { data: ownedGoal, error: goalError } =
+      await supabase
+        .from('goals')
+        .select('*')
+        .eq('id', body.goal.id)
+        .eq('user_id', user.id)
+        .single()
+
+    if (goalError || !ownedGoal) {
+      return NextResponse.json(
+        { error: 'Goal not found.' },
+        { status: 404 },
+      )
+    }
+
+    const { data: currentTasks } =
+      await supabase
+        .from('tasks')
+        .select('*')
+        .eq('goal_id', ownedGoal.id)
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: true })
+
+    const { data: memories } =
+      await supabase
+        .from('memories')
+        .select('label,value,category')
+        .eq('user_id', user.id)
+
+    const plan = await replanGoal({
+      goal: ownedGoal,
+      tasks: currentTasks || [],
+      reason: String(body.reason).trim(),
+      memories: memories || [],
+    })
+
+    return NextResponse.json(plan)
+  } catch (error) {
+    console.error('Replan API error:', error)
+    return NextResponse.json(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Could not replan with AI.',
+      },
+      { status: 500 },
+    )
+  }
+}

@@ -1,3 +1,4 @@
+
 'use client'
 
 import {
@@ -10,6 +11,10 @@ import {
   useState,
 } from 'react'
 
+import {
+  profileFromAuthUser,
+  type AuthProfile,
+} from './auth-profile'
 import { createClient } from './supabase/client'
 import { addDays, TODAY } from './dates'
 import type {
@@ -20,6 +25,7 @@ import type {
 } from './types'
 
 type Ctx = {
+  user: AuthProfile
   goals: Goal[]
   memories: MemoryItem[]
   messages: ChatMessage[]
@@ -34,9 +40,16 @@ type Ctx = {
     v: string,
     c: 'context' | 'preferences',
   ) => Promise<void>
+  updateProfile: (name: string) => Promise<void>
+  deleteGoal: (goalId: string) => Promise<void>
 }
 
 const C = createContext<Ctx | null>(null)
+
+const DEFAULT_USER: AuthProfile = {
+  name: 'Pilot',
+  email: '',
+}
 
 export function goalProgress(g: Goal) {
   return g.tasks.length
@@ -76,17 +89,13 @@ export function LifePilotProvider({
 }: {
   children: React.ReactNode
 }) {
+  const [user, setUser] = useState<AuthProfile>(DEFAULT_USER)
   const [goals, setGoals] = useState<Goal[]>([])
   const [memories, setMemories] = useState<MemoryItem[]>([])
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [activity, setActivity] = useState<Activity[]>([])
   const [isThinking, setThinking] = useState(false)
 
-  /*
-   * IMPORTANT:
-   * Do not create the Supabase client during Next.js build/prerender.
-   * It is created lazily in the browser when it is actually needed.
-   */
   const sbRef = useRef<ReturnType<typeof createClient> | null>(null)
 
   const getSb = useCallback(() => {
@@ -101,51 +110,75 @@ export function LifePilotProvider({
     return sbRef.current
   }, [])
 
+  const clearUserData = useCallback(() => {
+    setUser(DEFAULT_USER)
+    setGoals([])
+    setMemories([])
+    setMessages([])
+    setActivity([])
+  }, [])
+
   const refresh = useCallback(async () => {
     const sb = getSb()
 
     const {
-      data: { user },
+      data: { user: authUser },
+      error: authError,
     } = await sb.auth.getUser()
 
-    if (!user) return
+    // No active session is a normal unauthenticated state.
+    // Clear private data instead of throwing AuthSessionMissingError.
+    if (!authUser) {
+      clearUserData()
+      return
+    }
+
+    if (authError) {
+      throw authError
+    }
+
+    setUser(profileFromAuthUser(authUser))
 
     const [gs, ts, ms, cs, as] = await Promise.all([
       sb
         .from('goals')
         .select('*')
-        .eq('user_id', user.id)
+        .eq('user_id', authUser.id)
         .order('created_at', { ascending: false }),
 
       sb
         .from('tasks')
         .select('*')
-        .eq('user_id', user.id)
+        .eq('user_id', authUser.id)
         .order('due_date'),
 
       sb
         .from('memories')
         .select('*')
-        .eq('user_id', user.id)
+        .eq('user_id', authUser.id)
         .order('created_at', { ascending: false }),
 
       sb
         .from('agent_messages')
         .select('*')
-        .eq('user_id', user.id)
+        .eq('user_id', authUser.id)
         .order('created_at'),
 
       sb
         .from('activity')
         .select('*')
-        .eq('user_id', user.id)
+        .eq('user_id', authUser.id)
         .order('created_at', { ascending: false }),
     ])
 
+    if (gs.error) throw gs.error
+    if (ts.error) throw ts.error
+    if (ms.error) throw ms.error
+    if (cs.error) throw cs.error
+    if (as.error) throw as.error
+
     setGoals(
-      (gs.data || []).map((g) =>
-        mapGoal(g, ts.data || []),
-      ),
+      (gs.data || []).map((g) => mapGoal(g, ts.data || [])),
     )
 
     setMemories(
@@ -176,10 +209,12 @@ export function LifePilotProvider({
         time: a.created_at,
       })),
     )
-  }, [getSb])
+  }, [getSb, clearUserData])
 
   useEffect(() => {
-    void refresh()
+    void refresh().catch((error) => {
+      console.error('Could not load LifePilot data:', error)
+    })
   }, [refresh])
 
   const createGoal = useCallback(
@@ -187,105 +222,88 @@ export function LifePilotProvider({
       setThinking(true)
 
       try {
+        const sb = getSb()
+
+        const {
+          data: { user: authUser },
+          error: authError,
+        } = await sb.auth.getUser()
+
+        if (authError || !authUser) {
+          throw new Error('Please sign in before creating a goal.')
+        }
+
         const r = await fetch('/api/plan', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            title,
-            details,
-          }),
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title, details }),
         })
 
         const plan = await r.json()
 
         if (!r.ok) {
-          throw new Error(
-            plan.error || 'Could not create plan.',
-          )
+          throw new Error(plan.error || 'Could not create plan.')
         }
 
-        const sb = getSb()
-
-        const {
-          data: { user },
-        } = await sb.auth.getUser()
-
-        if (!user) {
-          throw new Error(
-            'Please sign in again.',
-          )
-        }
-
-        const {
-          data: g,
-          error,
-        } = await sb
+        const { data: g, error } = await sb
           .from('goals')
           .insert({
-            user_id: user.id,
+            user_id: authUser.id,
             title,
-            description: details,
-            category:
-              plan.category || 'Personal',
-            deadline: addDays(TODAY, 30),
+            description: plan.description || details,
+            category: plan.category || 'Personal',
+            deadline: addDays(
+              TODAY,
+              Math.max(1, Number(plan.deadlineOffset) || 30),
+            ),
             outcomes: plan.outcomes || [],
-            milestones:
-              plan.milestones || [],
+            milestones: plan.milestones || [],
           })
           .select()
           .single()
 
         if (error) throw error
 
-        const rows = (plan.tasks || []).map(
-          (t: any) => ({
-            user_id: user.id,
-            goal_id: g.id,
-            title: t.title,
-            due_date: addDays(
-              TODAY,
-              Math.max(
-                0,
-                Number(t.day) - 1,
-              ),
+        // Support both the newer dueOffset field and the older day field.
+        const rows = (plan.tasks || []).map((t: any) => ({
+          user_id: authUser.id,
+          goal_id: g.id,
+          title: t.title,
+          due_date: addDays(
+            TODAY,
+            Math.max(
+              0,
+              (Number(t.dueOffset ?? t.day) || 1) - 1,
             ),
-            duration:
-              t.duration || '30 min',
-            done: false,
-            adjusted: false,
-            purpose:
-              t.purpose || '',
-            steps: Array.isArray(t.steps)
-              ? t.steps
-              : [],
-            result:
-              t.result || '',
-          }),
-        )
+          ),
+          duration: t.duration || '30 min',
+          done: false,
+          adjusted: false,
+          purpose: t.purpose || '',
+          steps: Array.isArray(t.steps) ? t.steps : [],
+          result: t.result || '',
+        }))
 
-        const {
-          error: te,
-        } = await sb
-          .from('tasks')
-          .insert(rows)
+        if (rows.length > 0) {
+          const { error: taskError } = await sb
+            .from('tasks')
+            .insert(rows)
 
-        if (te) throw te
+          if (taskError) throw taskError
+        }
 
-        await sb
+        const { error: activityError } = await sb
           .from('activity')
           .insert({
-            user_id: user.id,
+            user_id: authUser.id,
             kind: 'created',
-            title:
-              `Created goal: ${title}`,
-            detail:
-              `${rows.length} tasks generated.`,
+            title: `Created goal: ${title}`,
+            detail: `${rows.length} tasks generated.`,
           })
 
-        await refresh()
+        if (activityError) throw activityError
 
+        await refresh()
         return g.id
       } finally {
         setThinking(false)
@@ -295,27 +313,21 @@ export function LifePilotProvider({
   )
 
   const toggleTask = useCallback(
-    async (
-      goalId: string,
-      taskId: string,
-    ) => {
-      const g = goals.find(
-        (x) => x.id === goalId,
-      )
-
-      const t = g?.tasks.find(
-        (x) => x.id === taskId,
-      )
+    async (goalId: string, taskId: string) => {
+      const g = goals.find((x) => x.id === goalId)
+      const t = g?.tasks.find((x) => x.id === taskId)
 
       if (!t) return
 
       const sb = getSb()
-
       const {
-        data: { user },
+        data: { user: authUser },
+        error: authError,
       } = await sb.auth.getUser()
 
-      if (!user) return
+      if (authError || !authUser) {
+        throw new Error('Please sign in again.')
+      }
 
       const done = !t.done
 
@@ -323,20 +335,22 @@ export function LifePilotProvider({
         .from('tasks')
         .update({ done })
         .eq('id', taskId)
-        .eq('user_id', user.id)
+        .eq('user_id', authUser.id)
 
       if (error) throw error
 
-      await sb
-        .from('activity')
-        .insert({
-          user_id: user.id,
-          kind: 'completed',
-          title: done
-            ? `Completed: ${t.title}`
-            : `Reopened: ${t.title}`,
-          detail: g?.title || '',
-        })
+      const { error: activityError } = await sb
+  .from('activity')
+  .insert({
+    user_id: authUser.id,
+    kind: 'completed',
+    title: done
+      ? `Completed: ${t.title}`
+      : `Reopened: ${t.title}`,
+    detail: g?.title ?? '',
+  })
+
+      if (activityError) throw activityError
 
       await refresh()
     },
@@ -344,116 +358,93 @@ export function LifePilotProvider({
   )
 
   const replanGoal = useCallback(
-    async (
-      goalId: string,
-      reason: string,
-    ) => {
-      const g = goals.find(
-        (x) => x.id === goalId,
-      )
+    async (goalId: string, reason: string) => {
+      const g = goals.find((x) => x.id === goalId)
 
       if (!g) {
-        throw new Error(
-          'Goal not found.',
-        )
+        throw new Error('Goal not found.')
       }
 
       setThinking(true)
 
       try {
-        const r = await fetch(
-          '/api/replan',
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type':
-                'application/json',
-            },
-            body: JSON.stringify({
-              goal: g,
-              tasks: g.tasks,
-              reason,
-            }),
-          },
-        )
+        const sb = getSb()
+        const {
+          data: { user: authUser },
+          error: authError,
+        } = await sb.auth.getUser()
+
+        if (authError || !authUser) {
+          throw new Error('Please sign in again.')
+        }
+
+        const r = await fetch('/api/replan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            goal: g,
+            tasks: g.tasks,
+            reason,
+          }),
+        })
 
         const result = await r.json()
 
         if (!r.ok) {
-          throw new Error(
-            result.error ||
-              'Could not replan.',
-          )
-        }
-
-        const sb = getSb()
-
-        const {
-          data: { user },
-        } = await sb.auth.getUser()
-
-        if (!user) {
-          throw new Error(
-            'Please sign in again.',
-          )
+          throw new Error(result.error || 'Could not replan.')
         }
 
         const completed = new Set(
           g.tasks
             .filter((t) => t.done)
-            .map((t) =>
-              t.title.toLowerCase(),
-            ),
+            .map((t) => t.title.toLowerCase()),
         )
 
-        await sb
+        const { error: deleteError } = await sb
           .from('tasks')
           .delete()
           .eq('goal_id', goalId)
-          .eq('user_id', user.id)
+          .eq('user_id', authUser.id)
 
-        const rows = (
-          result.tasks || []
-        ).map((t: any) => ({
-          user_id: user.id,
+        if (deleteError) throw deleteError
+
+        const rows = (result.tasks || []).map((t: any) => ({
+          user_id: authUser.id,
           goal_id: goalId,
           title: t.title,
           due_date: addDays(
             TODAY,
             Math.max(
               0,
-              Number(t.day) - 1,
+              (Number(t.dueOffset ?? t.day) || 1) - 1,
             ),
           ),
-          duration:
-            t.duration || '30 min',
-          done: completed.has(
-            String(t.title).toLowerCase(),
-          ),
+          duration: t.duration || '30 min',
+          done: completed.has(String(t.title).toLowerCase()),
           adjusted: true,
-          purpose:
-            t.purpose || '',
-          steps: Array.isArray(t.steps)
-            ? t.steps
-            : [],
-          result:
-            t.result || '',
+          purpose: t.purpose || '',
+          steps: Array.isArray(t.steps) ? t.steps : [],
+          result: t.result || '',
         }))
 
-        await sb
-          .from('tasks')
-          .insert(rows)
+        if (rows.length > 0) {
+          const { error: insertError } = await sb
+            .from('tasks')
+            .insert(rows)
 
-        await sb
+          if (insertError) throw insertError
+        }
+
+        const { error: activityError } = await sb
           .from('activity')
           .insert({
-            user_id: user.id,
+            user_id: authUser.id,
             kind: 'replanned',
-            title:
-              `Replanned: ${g.title}`,
-            detail:
-              result.summary,
+            title: `Replanned: ${g.title}`,
+            detail: result.description || reason,
           })
+
+        if (activityError) throw activityError
 
         await refresh()
       } finally {
@@ -467,27 +458,27 @@ export function LifePilotProvider({
     async (
       label: string,
       value: string,
-      category:
-        | 'context'
-        | 'preferences',
+      category: 'context' | 'preferences',
     ) => {
       const sb = getSb()
-
       const {
-        data: { user },
+        data: { user: authUser },
+        error: authError,
       } = await sb.auth.getUser()
 
-      if (!user) return
+      if (authError || !authUser) {
+        throw new Error('Please sign in again.')
+      }
 
-      await sb
-        .from('memories')
-        .insert({
-          user_id: user.id,
-          category,
-          label,
-          value,
-          source: 'LifePilot',
-        })
+      const { error } = await sb.from('memories').insert({
+        user_id: authUser.id,
+        category,
+        label,
+        value,
+        source: 'LifePilot',
+      })
+
+      if (error) throw error
 
       await refresh()
     },
@@ -497,83 +488,133 @@ export function LifePilotProvider({
   const sendMessage = useCallback(
     async (text: string) => {
       const clean = text.trim()
-
       if (!clean) return
 
       setThinking(true)
 
       try {
         const sb = getSb()
-
         const {
-          data: { user },
+          data: { user: authUser },
+          error: authError,
         } = await sb.auth.getUser()
 
-        if (!user) {
-          throw new Error(
-            'Please sign in again.',
-          )
+        if (authError || !authUser) {
+          throw new Error('Please sign in again.')
         }
 
-        await sb
+        const { error: userMessageError } = await sb
           .from('agent_messages')
           .insert({
-            user_id: user.id,
+            user_id: authUser.id,
             role: 'user',
             content: clean,
           })
 
-        const r = await fetch(
-          '/api/agent',
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type':
-                'application/json',
-            },
-            body: JSON.stringify({
-              message: clean,
-              goals,
-              memory: memories,
-              history:
-                messages.slice(-10),
-            }),
-          },
-        )
+        if (userMessageError) throw userMessageError
+
+        const r = await fetch('/api/agent', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: clean,
+            goals,
+            memory: memories,
+            history: messages.slice(-10),
+          }),
+        })
 
         const body = await r.json()
 
         if (!r.ok) {
-          throw new Error(
-            body.error ||
-              'Agent unavailable.',
-          )
+          throw new Error(body.error || 'Agent unavailable.')
         }
 
-        await sb
+        const { error: assistantMessageError } = await sb
           .from('agent_messages')
           .insert({
-            user_id: user.id,
+            user_id: authUser.id,
             role: 'assistant',
             content: body.response,
           })
+
+        if (assistantMessageError) throw assistantMessageError
 
         await refresh()
       } finally {
         setThinking(false)
       }
     },
-    [
-      getSb,
-      goals,
-      memories,
-      messages,
-      refresh,
-    ],
+    [getSb, goals, memories, messages, refresh],
+  )
+
+  const updateProfile = useCallback(
+    async (name: string) => {
+      const cleanName = name.trim()
+
+      if (!cleanName) {
+        throw new Error('Name cannot be empty.')
+      }
+
+      const sb = getSb()
+      const {
+        data: { user: authUser },
+        error: authError,
+      } = await sb.auth.getUser()
+
+      if (authError || !authUser) {
+        throw new Error('Please sign in again.')
+      }
+
+      const { data, error } = await sb.auth.updateUser({
+        data: { full_name: cleanName },
+      })
+
+      if (error) throw error
+
+      if (data.user) {
+        setUser(profileFromAuthUser(data.user))
+      }
+    },
+    [getSb],
+  )
+
+  const deleteGoal = useCallback(
+    async (goalId: string) => {
+      const sb = getSb()
+      const {
+        data: { user: authUser },
+        error: authError,
+      } = await sb.auth.getUser()
+
+      if (authError || !authUser) {
+        throw new Error('Please sign in again.')
+      }
+
+      const { error: taskError } = await sb
+        .from('tasks')
+        .delete()
+        .eq('goal_id', goalId)
+        .eq('user_id', authUser.id)
+
+      if (taskError) throw taskError
+
+      const { error: goalError } = await sb
+        .from('goals')
+        .delete()
+        .eq('id', goalId)
+        .eq('user_id', authUser.id)
+
+      if (goalError) throw goalError
+
+      await refresh()
+    },
+    [getSb, refresh],
   )
 
   const value = useMemo(
     () => ({
+      user,
       goals,
       memories,
       messages,
@@ -584,8 +625,11 @@ export function LifePilotProvider({
       replanGoal,
       sendMessage,
       addMemory,
+      updateProfile,
+      deleteGoal,
     }),
     [
+      user,
       goals,
       memories,
       messages,
@@ -596,6 +640,8 @@ export function LifePilotProvider({
       replanGoal,
       sendMessage,
       addMemory,
+      updateProfile,
+      deleteGoal,
     ],
   )
 
@@ -610,9 +656,7 @@ export function useLifePilot() {
   const v = useContext(C)
 
   if (!v) {
-    throw new Error(
-      'LifePilotProvider missing',
-    )
+    throw new Error('LifePilotProvider missing')
   }
 
   return v
