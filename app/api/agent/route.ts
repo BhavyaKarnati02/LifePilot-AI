@@ -1,74 +1,130 @@
 
-import { NextResponse } from 'next/server';
+import { NextResponse } from 'next/server'
+
+export const runtime = 'nodejs'
 
 export async function POST(req: Request) {
   try {
-    const body = await req.json();
-    const message = String(body.message || '').trim();
+    const body = await req.json()
+    const message = String(body.message || '').trim()
 
     if (!message) {
       return NextResponse.json(
         { error: 'Message is required.' },
-        { status: 400 }
-      );
+        { status: 400 },
+      )
+    }
+
+    const apiKey = process.env.GEMINI_API_KEY
+    const model =
+      process.env.GEMINI_MODEL || 'gemini-2.5-flash'
+
+    if (!apiKey) {
+      console.error('GEMINI_API_KEY is not configured.')
+
+      return NextResponse.json(
+        { error: 'The AI service is not configured.' },
+        { status: 500 },
+      )
     }
 
     const prompt = `
 You are LifePilot, a concise goal-management agent.
+
 Use the supplied goals, memories, and conversation.
 Help the user act, track, and adapt goals.
 Never invent completed work.
+Be practical, supportive, concise, and actionable.
+When useful, suggest a concrete next step based on the user's goals.
 
-USER: ${message}
-GOALS: ${JSON.stringify(body.goals || [])}
-MEMORY: ${JSON.stringify(body.memory || [])}
-HISTORY: ${JSON.stringify(body.history || [])}
+USER:
+${message}
+
+GOALS:
+${JSON.stringify(body.goals || [])}
+
+MEMORY:
+${JSON.stringify(body.memory || [])}
+
+HISTORY:
+${JSON.stringify(body.history || [])}
 
 Respond concisely and actionably.
-`;
+`
 
-    const ollamaUrl =
-      process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
-
-    const model = process.env.OLLAMA_MODEL || 'qwen2.5:3b';
-
-    const response = await fetch(`${ollamaUrl}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model,
-        messages: [{ role: 'user', content: prompt }],
-        stream: false
-      }),
-      signal: AbortSignal.timeout(60000)
-    });
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: prompt }],
+            },
+          ],
+          generationConfig: {
+            temperature: 0.4,
+            maxOutputTokens: 2048,
+          },
+        }),
+        signal: AbortSignal.timeout(60000),
+      },
+    )
 
     if (!response.ok) {
-      console.error('Ollama returned status:', response.status);
+      const detail = await response.text().catch(() => '')
+
+      console.error(
+        'Gemini agent API error:',
+        response.status,
+        detail,
+      )
 
       return NextResponse.json(
-        { error: 'The AI agent is temporarily unavailable. Please try again.' },
-        { status: 502 }
-      );
+        {
+          error:
+            'The AI agent is temporarily unavailable. Please try again.',
+        },
+        { status: 502 },
+      )
     }
 
-    const result = await response.json();
-    const answer = result.message?.content?.trim();
+    const result = await response.json()
+
+    const answer = result?.candidates?.[0]?.content?.parts
+      ?.map((part: { text?: string }) => part.text || '')
+      .join('')
+      .trim()
 
     if (!answer) {
+      console.error(
+        'Gemini returned no text.',
+        result?.promptFeedback,
+      )
+
       return NextResponse.json(
-        { error: 'The AI returned an empty response. Please try again.' },
-        { status: 502 }
-      );
+        {
+          error:
+            'The AI returned an empty response. Please try again.',
+        },
+        { status: 502 },
+      )
     }
 
-    return NextResponse.json({ response: answer });
+    return NextResponse.json({ response: answer })
   } catch (error) {
-    console.error('LifePilot Agent error:', error);
+    console.error('LifePilot Agent error:', error)
 
     return NextResponse.json(
-      { error: 'Could not reach the AI agent. Check that Ollama is running.' },
-      { status: 503 }
-    );
+      {
+        error:
+          'Could not reach the AI service. Please try again.',
+      },
+      { status: 503 },
+    )
   }
 }
