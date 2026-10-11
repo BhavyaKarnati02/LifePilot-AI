@@ -1,2 +1,74 @@
-import{BedrockRuntimeClient,ConverseCommand}from'@aws-sdk/client-bedrock-runtime';import{NextResponse}from'next/server'
-const client=new BedrockRuntimeClient({region:process.env.AWS_REGION||'us-east-1'}),modelId=process.env.BEDROCK_MODEL_ID||'amazon.nova-lite-v1:0';export async function POST(req:Request){try{const b=await req.json(),message=String(b.message||'').trim();if(!message)return NextResponse.json({error:'Message is required.'},{status:400});const prompt=`You are LifePilot, a concise goal-management agent. Use supplied goals, memories and conversation. Help the user act, track and adapt goals; never invent completed work. USER: ${message} GOALS: ${JSON.stringify(b.goals||[])} MEMORY: ${JSON.stringify(b.memory||[])} HISTORY: ${JSON.stringify(b.history||[])} Respond concisely and actionably.`;const r=await client.send(new ConverseCommand({modelId,messages:[{role:'user',content:[{text:prompt}]}],inferenceConfig:{maxTokens:1500,temperature:0.4}}));return NextResponse.json({response:r.output?.message?.content?.map((x:any)=>x.text||'').join('').trim()||'I could not generate a response right now.'})}catch(e){console.error(e);return NextResponse.json({error:'Agent is unavailable. Check AWS Bedrock access.'},{status:500})}}
+
+import { NextResponse } from 'next/server';
+
+export async function POST(req: Request) {
+  try {
+    const body = await req.json();
+    const message = String(body.message || '').trim();
+
+    if (!message) {
+      return NextResponse.json(
+        { error: 'Message is required.' },
+        { status: 400 }
+      );
+    }
+
+    const prompt = `
+You are LifePilot, a concise goal-management agent.
+Use the supplied goals, memories, and conversation.
+Help the user act, track, and adapt goals.
+Never invent completed work.
+
+USER: ${message}
+GOALS: ${JSON.stringify(body.goals || [])}
+MEMORY: ${JSON.stringify(body.memory || [])}
+HISTORY: ${JSON.stringify(body.history || [])}
+
+Respond concisely and actionably.
+`;
+
+    const ollamaUrl =
+      process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
+
+    const model = process.env.OLLAMA_MODEL || 'qwen2.5:3b';
+
+    const response = await fetch(`${ollamaUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: prompt }],
+        stream: false
+      }),
+      signal: AbortSignal.timeout(60000)
+    });
+
+    if (!response.ok) {
+      console.error('Ollama returned status:', response.status);
+
+      return NextResponse.json(
+        { error: 'The AI agent is temporarily unavailable. Please try again.' },
+        { status: 502 }
+      );
+    }
+
+    const result = await response.json();
+    const answer = result.message?.content?.trim();
+
+    if (!answer) {
+      return NextResponse.json(
+        { error: 'The AI returned an empty response. Please try again.' },
+        { status: 502 }
+      );
+    }
+
+    return NextResponse.json({ response: answer });
+  } catch (error) {
+    console.error('LifePilot Agent error:', error);
+
+    return NextResponse.json(
+      { error: 'Could not reach the AI agent. Check that Ollama is running.' },
+      { status: 503 }
+    );
+  }
+}
