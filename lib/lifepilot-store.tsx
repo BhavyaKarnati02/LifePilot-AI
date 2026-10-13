@@ -174,13 +174,18 @@ export function LifePilotProvider({
     } = await sb.auth.getUser()
 
     if (authError) {
-      throw authError
-    }
+  if (authError.name === 'AuthSessionMissingError') {
+    clearUserData()
+    return
+  }
 
-    if (!authUser) {
-      clearUserData()
-      return
-    }
+  throw authError
+}
+
+if (!authUser) {
+  clearUserData()
+  return
+}
 
     setUser(profileFromAuthUser(authUser))
 
