@@ -17,7 +17,7 @@ export async function POST(req: Request) {
 
     const apiKey = process.env.GEMINI_API_KEY
     const model =
-      process.env.GEMINI_MODEL || 'gemini-3.8-flash'
+      process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite'
 
     if (!apiKey) {
       console.error('GEMINI_API_KEY is not configured.')
