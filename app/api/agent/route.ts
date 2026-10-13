@@ -17,7 +17,7 @@ export async function POST(req: Request) {
 
     const apiKey = process.env.GEMINI_API_KEY
     const model =
-      process.env.GEMINI_MODEL || 'gemini-2.5-flash'
+      process.env.GEMINI_MODEL || 'gemini-3.8-flash'
 
     if (!apiKey) {
       console.error('GEMINI_API_KEY is not configured.')
@@ -52,28 +52,47 @@ ${JSON.stringify(body.history || [])}
 Respond concisely and actionably.
 `
 
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              role: 'user',
-              parts: [{ text: prompt }],
-            },
-          ],
-          generationConfig: {
-            temperature: 0.4,
-            maxOutputTokens: 2048,
+    let response: Response | undefined
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
           },
-        }),
-        signal: AbortSignal.timeout(60000),
-      },
-    )
+          body: JSON.stringify({
+            contents: [
+              {
+                role: 'user',
+                parts: [{ text: prompt }],
+              },
+            ],
+            generationConfig: {
+              temperature: 0.4,
+              maxOutputTokens: 2048,
+            },
+          }),
+          signal: AbortSignal.timeout(60000),
+        },
+      )
+
+      if (response.status !== 503 || attempt === 2) {
+        break
+      }
+
+      await new Promise((resolve) =>
+        setTimeout(resolve, 1500 * (attempt + 1)),
+      )
+    }
+
+    if (!response) {
+      return NextResponse.json(
+        { error: 'The AI service did not respond. Please try again.' },
+        { status: 502 },
+      )
+    }
 
     if (!response.ok) {
       const detail = await response.text().catch(() => '')
