@@ -143,11 +143,7 @@ async function askAI(
   if (!response.ok) {
     const detail = await response.text().catch(() => '')
 
-    console.error(
-      'Gemini API error:',
-      response.status,
-      detail,
-    )
+    console.error('Gemini API error:', response.status, JSON.stringify(detail, null, 2))
 
     throw new Error(
       `AI request failed (${response.status}). Check the API key, model, and quota.`,
